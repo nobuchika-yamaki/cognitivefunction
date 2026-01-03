@@ -1,0 +1,422 @@
+"""
+Minimal hemispheric-asymmetry agency model (Methods-consistent)
+
+Core definitions (match Methods):
+- Motor command: m(t)
+- Sensory feedback: s(t) = m(t-Δt_world) + noise + optional external perturbations
+- Left hemisphere: action-conditioned forward model  ŷ_L(t) = E[s(t) | m(t-Δt_A)]
+- Right hemisphere: action-agnostic environment model ŷ_R(t) = E[s(t) | past s]
+  (STRICT: no access to m, no efference copy, no proxies)
+- Errors: ε_L(t)=s(t)-ŷ_L(t), ε_R(t)=s(t)-ŷ_R(t)
+- Agency variable: A(t)=|ε_R(t)| - |ε_L(t)|
+- Decision: self if A(t) > θ
+- Temporal asymmetry: τ_L < τ_R (applied to error evidence accumulation only)
+
+Outputs:
+- Fig 3A: A(t) time series (no legend)
+- Fig 3B: A(t) distributions
+- Fig 3C-1: temporal stability index = 1/Var[A(t)]
+- Fig 3C-2: attribution consistency = fraction of time belonging to runs of (A>θ) lasting ≥ window
+
+No external data required.
+"""
+
+from __future__ import annotations
+import numpy as np
+import matplotlib.pyplot as plt
+
+
+# -------------------------
+# Helpers
+# -------------------------
+
+def ema(x: np.ndarray, tau: float) -> np.ndarray:
+    """Causal exponential moving average; tau>0, larger => longer integration."""
+    if tau <= 0:
+        raise ValueError("tau must be > 0")
+    a = 1.0 / tau
+    y = np.empty_like(x, dtype=float)
+    y[0] = float(x[0])
+    for t in range(1, len(x)):
+        y[t] = (1 - a) * y[t - 1] + a * float(x[t])
+    return y
+
+
+def fit_linear_forward(m: np.ndarray, s: np.ndarray) -> tuple[float, float]:
+    """Fit s ≈ a*m + b by least squares. Returns (a,b)."""
+    X = np.column_stack([m, np.ones_like(m)])
+    beta, *_ = np.linalg.lstsq(X, s, rcond=None)
+    return float(beta[0]), float(beta[1])
+
+
+def fit_ar1(s: np.ndarray) -> tuple[float, float]:
+    """Fit s[t] ≈ phi*s[t-1] + c (AR(1)). Returns (phi,c)."""
+    if len(s) < 2:
+        raise ValueError("Need len(s) >= 2")
+    y = s[1:]
+    x = s[:-1]
+    X = np.column_stack([x, np.ones_like(x)])
+    beta, *_ = np.linalg.lstsq(X, y, rcond=None)
+    return float(beta[0]), float(beta[1])
+
+
+def shift_with_zeros(x: np.ndarray, k: int) -> np.ndarray:
+    """Return x shifted by k steps to the right: y[t]=x[t-k] if t-k>=0 else 0."""
+    y = np.zeros_like(x, dtype=float)
+    if k <= 0:
+        return x.copy()
+    y[k:] = x[:-k]
+    return y
+
+
+# -------------------------
+# Generative process
+# -------------------------
+
+def generate_motor(T: int, seed: int) -> np.ndarray:
+    """Band-limited motor command (AR(1)+sine)."""
+    rng = np.random.default_rng(seed)
+    m = np.zeros(T, dtype=float)
+    phi = 0.98
+    eps = rng.normal(0.0, 0.4, T)
+    for t in range(1, T):
+        m[t] = phi * m[t - 1] + eps[t]
+    m += 0.5 * np.sin(2 * np.pi * np.arange(T) / 200.0)
+    return m
+
+
+def make_intervals(T: int, period: int = 600, ext_len: int = 120) -> tuple[np.ndarray, np.ndarray]:
+    """Alternating intervals: external perturbation True for ext_len each period."""
+    external = np.zeros(T, dtype=bool)
+    for start in range(0, T, period):
+        external[start:start + ext_len] = True
+    self_mask = ~external
+    return self_mask, external
+
+
+def generate_sensory(
+    m: np.ndarray,
+    dt_world: int,
+    sigma: float,
+    external_mask: np.ndarray,
+    ext_amp: float,
+    seed: int
+) -> np.ndarray:
+    """s(t)=m(t-dt_world)+noise+external bursts (when external_mask True)."""
+    rng = np.random.default_rng(seed)
+    T = len(m)
+    s = shift_with_zeros(m, dt_world)
+    s += rng.normal(0.0, sigma, T)
+
+    if np.any(external_mask):
+        burst = rng.normal(0.0, 1.0, T)
+        burst = ema(burst, tau=10.0)
+        s[external_mask] += ext_amp * burst[external_mask]
+    return s
+
+
+# -------------------------
+# Hemispheric predictors (STRICT info constraints)
+# -------------------------
+
+def predict_left_forward(m: np.ndarray, s: np.ndarray, dt_A: int, calib_idx: np.ndarray) -> np.ndarray:
+    """
+    Left hemisphere forward model: ŷ_L(t)=E[s(t)|m(t-dt_A)].
+    Implemented as linear regression on delayed motor.
+    """
+    mA = shift_with_zeros(m, dt_A)
+    a, b = fit_linear_forward(mA[calib_idx], s[calib_idx])
+    return a * mA + b
+
+
+def predict_right_env(s: np.ndarray, calib_idx: np.ndarray) -> np.ndarray:
+    """
+    Right hemisphere environment model: ŷ_R(t)=E[s(t)|past s], AR(1).
+    STRICT: uses only s history, no m, no proxies.
+    """
+    # Fit AR(1) on calibration slice of s only
+    # We fit on a contiguous chunk for simplicity; take min/max of calib_idx range
+    lo = int(np.min(calib_idx))
+    hi = int(np.max(calib_idx)) + 1
+    s_cal = s[lo:hi]
+    phi, c = fit_ar1(s_cal)
+
+    y = np.zeros_like(s, dtype=float)
+    y[0] = s[0]
+    for t in range(1, len(s)):
+        y[t] = phi * s[t - 1] + c
+    return y
+
+
+# -------------------------
+# Agency computation (Methods-consistent)
+# -------------------------
+
+def compute_agency_A(
+    s: np.ndarray,
+    yL: np.ndarray,
+    yR: np.ndarray,
+    tau_L: float,
+    tau_R: float,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """
+    ε_L = s - yL, ε_R = s - yR
+    Evidence accumulation uses temporal integration constants τ_L, τ_R
+    A(t) = |ε_R|_τR - |ε_L|_τL   (rectified, integrated)
+    """
+    eL = s - yL
+    eR = s - yR
+
+    # Rectify magnitudes
+    magL = np.abs(eL)
+    magR = np.abs(eR)
+
+    # Temporal integration (this is where τ_L < τ_R matters)
+    magL_int = ema(magL, tau=tau_L)
+    magR_int = ema(magR, tau=tau_R)
+
+    A = magR_int - magL_int
+    return A, eL, eR
+
+
+# -------------------------
+# Metrics (Fig 3C-1, 3C-2)
+# -------------------------
+
+def temporal_stability_index(A: np.ndarray) -> float:
+    v = float(np.var(A))
+    return 1.0 / (v + 1e-12)
+
+
+def attribution_consistency(A: np.ndarray, theta: float, window: int) -> float:
+    """
+    Fraction of time points that belong to runs where (A>theta) lasts >= window.
+    """
+    x = A > theta
+    T = len(x)
+    good = np.zeros(T, dtype=bool)
+    run = 0
+    for t in range(T):
+        if x[t]:
+            run += 1
+        else:
+            if run >= window:
+                good[t - run:t] = True
+            run = 0
+    if run >= window:
+        good[T - run:T] = True
+    return float(good.mean())
+
+
+# -------------------------
+# Single run under a condition
+# -------------------------
+
+def run_condition(
+    *,
+    T: int,
+    dt_world: int,
+    dt_A: int,
+    sigma: float,
+    tau_L: float,
+    tau_R: float,
+    ext_amp: float,
+    seed: int,
+    symmetric_mode: str | None = None,
+) -> dict[str, np.ndarray]:
+    """
+    Conditions:
+    - None: asymmetric architecture (L motor-conditioned; R motor-blind; τ_L < τ_R)
+    - "symmetric_tau": τ_L = τ_R but keep info asymmetry (tests temporal asymmetry necessity)
+    - "symmetric_info": remove info asymmetry by forcing both predictors to be motor-blind env models
+                        (agency should collapse due to identifiability loss)
+    """
+    m = generate_motor(T, seed=seed)
+    self_mask, external_mask = make_intervals(T)
+
+    s = generate_sensory(
+        m=m,
+        dt_world=dt_world,
+        sigma=sigma,
+        external_mask=external_mask,
+        ext_amp=ext_amp,
+        seed=seed + 100
+    )
+
+    # Calibration: early self interval only (avoid external)
+    calib_len = int(0.2 * T)
+    calib_idx = np.where(self_mask[:calib_len])[0]
+    if len(calib_idx) < 20:
+        calib_idx = np.arange(1, calib_len)
+
+    if symmetric_mode == "symmetric_info":
+        # BOTH are environment models (both motor-blind); also enforce same tau by default for strict symmetry
+        yL = predict_right_env(s, calib_idx)
+        yR = predict_right_env(s, calib_idx)
+    else:
+        # Standard: left forward, right env
+        yL = predict_left_forward(m, s, dt_A, calib_idx)
+        yR = predict_right_env(s, calib_idx)
+
+    if symmetric_mode == "symmetric_tau":
+        tau_L_eff = float((tau_L + tau_R) / 2.0)
+        tau_R_eff = float((tau_L + tau_R) / 2.0)
+    elif symmetric_mode == "symmetric_info":
+        # if you want fully symmetric: same tau also (keep as written)
+        tau_L_eff = float((tau_L + tau_R) / 2.0)
+        tau_R_eff = float((tau_L + tau_R) / 2.0)
+    else:
+        tau_L_eff, tau_R_eff = float(tau_L), float(tau_R)
+
+    A, eL, eR = compute_agency_A(s, yL, yR, tau_L=tau_L_eff, tau_R=tau_R_eff)
+
+    return {
+        "m": m,
+        "s": s,
+        "A": A,
+        "eL": eL,
+        "eR": eR,
+        "self_mask": self_mask,
+        "external_mask": external_mask,
+    }
+
+
+# -------------------------
+# Figure 3 generation
+# -------------------------
+
+def make_figure3(
+    *,
+    T: int = 3000,
+    dt_world: int = 3,
+    dt_A: int = 3,
+    sigma: float = 0.25,
+    tau_L: float = 5.0,
+    tau_R: float = 25.0,
+    ext_amp: float = 2.0,
+    theta: float = 0.0,
+    window: int = 30,
+    n_runs: int = 50,
+    seed0: int = 0,
+    save_prefix: str | None = None,
+):
+    # Three curves for 3A/3B: pick one representative run each
+    rep_symtau = run_condition(
+        T=T, dt_world=dt_world, dt_A=dt_A, sigma=sigma, tau_L=tau_L, tau_R=tau_R,
+        ext_amp=ext_amp, seed=seed0, symmetric_mode="symmetric_tau"
+    )
+    rep_asym = run_condition(
+        T=T, dt_world=dt_world, dt_A=dt_A, sigma=sigma, tau_L=tau_L, tau_R=tau_R,
+        ext_amp=ext_amp, seed=seed0, symmetric_mode=None
+    )
+    rep_syminfo = run_condition(
+        T=T, dt_world=dt_world, dt_A=dt_A, sigma=sigma, tau_L=tau_L, tau_R=tau_R,
+        ext_amp=ext_amp, seed=seed0, symmetric_mode="symmetric_info"
+    )
+
+    A_symtau = rep_symtau["A"]
+    A_asym = rep_asym["A"]
+    A_syminfo = rep_syminfo["A"]
+
+    # Fig 3A: time series (NO legend)
+    plt.figure()
+    plt.plot(A_symtau)
+    plt.plot(A_asym)
+    plt.plot(A_syminfo)
+    plt.axhline(theta, linestyle="--")
+    plt.xlabel("Time")
+    plt.ylabel("A(t)")
+    plt.title("Figure 3A: Time series of the agency variable A(t)")
+    if save_prefix:
+        plt.savefig(f"{save_prefix}_Fig3A.png", dpi=300, bbox_inches="tight")
+    plt.show()
+
+    # Fig 3B: distributions
+    plt.figure()
+    plt.hist(A_symtau, bins=60, density=True, alpha=0.5)
+    plt.hist(A_asym, bins=60, density=True, alpha=0.5)
+    plt.hist(A_syminfo, bins=60, density=True, alpha=0.5)
+    plt.xlabel("A(t)")
+    plt.ylabel("Density")
+    plt.title("Figure 3B: Distribution of A(t)")
+    if save_prefix:
+        plt.savefig(f"{save_prefix}_Fig3B.png", dpi=300, bbox_inches="tight")
+    plt.show()
+
+    # Fig 3C metrics across runs
+    labels = ["Symmetric (τ only)", "Asymmetric", "Symmetric (info)"]
+    stab = np.zeros((n_runs, 3), dtype=float)
+    cons = np.zeros((n_runs, 3), dtype=float)
+
+    for i in range(n_runs):
+        seed = seed0 + 1000 + i
+
+        r1 = run_condition(
+            T=T, dt_world=dt_world, dt_A=dt_A, sigma=sigma, tau_L=tau_L, tau_R=tau_R,
+            ext_amp=ext_amp, seed=seed, symmetric_mode="symmetric_tau"
+        )
+        r2 = run_condition(
+            T=T, dt_world=dt_world, dt_A=dt_A, sigma=sigma, tau_L=tau_L, tau_R=tau_R,
+            ext_amp=ext_amp, seed=seed, symmetric_mode=None
+        )
+        r3 = run_condition(
+            T=T, dt_world=dt_world, dt_A=dt_A, sigma=sigma, tau_L=tau_L, tau_R=tau_R,
+            ext_amp=ext_amp, seed=seed, symmetric_mode="symmetric_info"
+        )
+
+        for j, A in enumerate([r1["A"], r2["A"], r3["A"]]):
+            stab[i, j] = temporal_stability_index(A)
+            cons[i, j] = attribution_consistency(A, theta=theta, window=window)
+
+    # Use means for bars (keeps code minimal)
+    stab_mean = stab.mean(axis=0)
+    cons_mean = cons.mean(axis=0)
+
+    plt.figure()
+    plt.bar(labels, stab_mean)
+    plt.xlabel("Condition")
+    plt.ylabel("Temporal stability index (1/Var[A])")
+    plt.title("Figure 3C-1: Temporal stability index")
+    plt.xticks(rotation=15, ha="right")
+    if save_prefix:
+        plt.savefig(f"{save_prefix}_Fig3C1.png", dpi=300, bbox_inches="tight")
+    plt.show()
+
+    plt.figure()
+    plt.bar(labels, cons_mean)
+    plt.xlabel("Condition")
+    plt.ylabel("Attribution consistency")
+    plt.title("Figure 3C-2: Attribution consistency")
+    plt.xticks(rotation=15, ha="right")
+    if save_prefix:
+        plt.savefig(f"{save_prefix}_Fig3C2.png", dpi=300, bbox_inches="tight")
+    plt.show()
+
+    return {
+        "rep": {"symtau": rep_symtau, "asym": rep_asym, "syminfo": rep_syminfo},
+        "metrics": {"stab": stab, "cons": cons, "labels": labels}
+    }
+
+
+if __name__ == "__main__":
+    # Base configuration (perfect temporal alignment)
+    make_figure3(
+        T=3000,
+        dt_world=3,
+        dt_A=3,
+        sigma=0.25,
+        tau_L=5.0,
+        tau_R=25.0,
+        ext_amp=2.0,
+        theta=0.0,
+        window=30,
+        n_runs=50,
+        seed0=0,
+        save_prefix=None,  # set e.g. "agency" to save PNGs
+    )
+
+    # Uncomment to test mismatch collapse (Results 3.2 style)
+    # make_figure3(dt_world=4, dt_A=3, save_prefix="mismatch")
+
+    # Uncomment to test robustness to noise
+    # make_figure3(sigma=0.4, save_prefix="noise")
